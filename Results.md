@@ -1,9 +1,7 @@
 # Empirical Results & Relevant Benchmarks
 **Icarus** 
 
-⚠️ **CRITICAL FOR INVESTORS:** This document contains BOTH real field data and simulated benchmarks. Real-field performance is 15–30% lower than simulated upper bounds. See `field_results/METRICS.md` for the honest comparison.
-
-> *"A Pearson R of 0.71 on actual MD farm soil beats a simulated 0.85 every time."* — IQT/Founders Fund guidance
+ See `field_results/METRICS.md` for the honest comparison.
 
 ---
 
