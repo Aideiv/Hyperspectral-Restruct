@@ -5,12 +5,17 @@
 # Model Architecture
 # =============================================================================
 model:
+  model_name: "base"          # Model variant: base, se, spectral, deep, hybrid
   num_bands: 200              # Number of spectral bands
   num_classes: 5              # Number of soil health classes
   num_contaminants: 4         # Number of contaminant types
   bottleneck_dim: 512         # Bottleneck layer dimension
   dropout_p: 0.5              # Dropout probability
   target_size: [64, 64]       # Spatial target size (H, W)
+  
+  # Variant-specific settings (used when model_name is se, hybrid, or deep)
+  se_reduction: 16            # SE block reduction ratio for se/hybrid models
+  blocks_per_layer: 3         # Number of residual blocks per layer for deep model
 
 # =============================================================================
 # Training Hyperparameters

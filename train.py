@@ -23,7 +23,7 @@ import os
 from pathlib import Path
 from typing import Optional, Tuple, List
 
-from model import SoilHSI3DCNN
+from model import create_model
 from dataset import HyperspectralSoilDataset, HyperspectralTransform
 from configs.constants import (
     CONTAMINANT_NAMES,
@@ -31,7 +31,9 @@ from configs.constants import (
     TRAINING_DEFAULTS,
     DATA_DEFAULTS,
     DEFAULT_PATHS,
+    MODEL_VARIANTS,
     get_full_config,
+    get_model_config,
 )
 
 
@@ -382,11 +384,33 @@ def train(cfg: dict, resume_path: str = None, data_dir: str = None, labels_file:
         else:
             train_loader, val_loader = create_dummy_dataloaders(cfg)
 
-        model = SoilHSI3DCNN(
-            num_bands=cfg["num_bands"],
-            num_classes=cfg["num_classes"],
-            num_contaminants=cfg["num_contaminants"],
-        ).to(device)
+        # Create model using factory - supports base, se, spectral, deep, hybrid variants
+        model_name = cfg.get("model_name", "base")
+        print(f"Using model variant: {model_name}")
+        
+        if model_name not in MODEL_VARIANTS:
+            raise ValueError(f"Unknown model: {model_name}. Choose from: {MODEL_VARIANTS}")
+        
+        # Extract model-specific kwargs from config
+        model_kwargs = {
+            "num_bands": cfg["num_bands"],
+            "num_classes": cfg["num_classes"],
+            "num_contaminants": cfg["num_contaminants"],
+            "bottleneck_dim": cfg.get("bottleneck_dim", 512),
+            "dropout_p": cfg.get("dropout_p", 0.5),
+        }
+        
+        # Add variant-specific kwargs
+        if model_name in ["se", "hybrid"]:
+            model_kwargs["se_reduction"] = cfg.get("se_reduction", 16)
+        if model_name == "deep":
+            model_kwargs["blocks_per_layer"] = cfg.get("blocks_per_layer", 3)
+        
+        model = create_model(model_name, **model_kwargs).to(device)
+        
+        # Log model size
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Model parameters: {total_params:,}")
 
         optimizer  = AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
         scheduler  = CosineAnnealingWarmRestarts(optimizer, T_0=cfg["cosine_T0"], T_mult=cfg["cosine_T_mult"])
@@ -516,16 +540,20 @@ def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="Train Hyperspectral Soil Classification Model")
     parser.add_argument("--config", type=str, help="Path to config JSON or YAML file")
+    parser.add_argument("--model", type=str, choices=MODEL_VARIANTS, 
+                       help=f"Model variant to use. Options: {', '.join(MODEL_VARIANTS)}")
     parser.add_argument("--resume", type=str, help="Path to checkpoint to resume from")
     parser.add_argument("--epochs", type=int, help="Number of epochs (overrides config)")
     parser.add_argument("--lr", type=float, help="Learning rate (overrides config)")
     parser.add_argument("--batch_size", type=int, help="Batch size (overrides config)")
     parser.add_argument("--save_path", type=str, help="Save path for model (overrides config)")
+    parser.add_argument("--dropout", type=float, help="Dropout probability (overrides config)")
     parser.add_argument("--calibrate", action="store_true", help="Enable radiometric calibration")
     parser.add_argument("--calib_config", type=str, help="Path to calibration config file")
     parser.add_argument("--data_dir", type=str, help="Directory containing hyperspectral data (.npy or .hdr files)")
     parser.add_argument("--labels_file", type=str, help="Path to labels CSV file (required if --data_dir is provided)")
     parser.add_argument("--use_dummy", action="store_true", help="Use dummy data for testing (ignores data_dir)")
+    parser.add_argument("--list_models", action="store_true", help="List available model variants and exit")
     return parser.parse_args()
 
 
@@ -547,6 +575,14 @@ def load_config(config_path: str) -> dict:
 
 def update_config_from_args(cfg: dict, args) -> dict:
     """Update config with command line arguments"""
+    if args.model:
+        cfg["model_name"] = args.model
+        # Apply variant-specific defaults if using a different model
+        variant_config = get_model_config(args.model)
+        # Only override if not already set in config file
+        for key, value in variant_config.items():
+            if key not in cfg or cfg.get(key) == MODEL_DEFAULTS.get(key):
+                cfg[key] = value
     if args.epochs:
         cfg["epochs"] = args.epochs
     if args.lr:
@@ -555,6 +591,8 @@ def update_config_from_args(cfg: dict, args) -> dict:
         cfg["batch_size"] = args.batch_size
     if args.save_path:
         cfg["save_path"] = args.save_path
+    if args.dropout:
+        cfg["dropout_p"] = args.dropout
     
     return cfg
 
@@ -563,6 +601,24 @@ def update_config_from_args(cfg: dict, args) -> dict:
 
 if __name__ == "__main__":
     args = parse_args()
+    
+    # Handle list_models flag
+    if args.list_models:
+        print("Available Model Variants:")
+        print("=" * 60)
+        from configs.constants import MODEL_VARIANT_CONFIGS
+        for name in MODEL_VARIANTS:
+            config = MODEL_VARIANT_CONFIGS.get(name, {})
+            print(f"\n{name}:")
+            print(f"  {config.get('description', 'No description')}")
+            print(f"  Recommended lr: {config.get('lr', 3e-4)}")
+            print(f"  Recommended dropout: {config.get('dropout_p', 0.5)}")
+        print("\n" + "=" * 60)
+        print("\nUsage examples:")
+        print("  python train.py --model se --epochs 100")
+        print("  python train.py --model hybrid --lr 2.5e-4 --dropout 0.55")
+        print("  python train.py --model deep --data_dir ./data --labels_file labels.csv")
+        exit(0)
     
     # Load configuration
     if args.config:
@@ -576,9 +632,14 @@ if __name__ == "__main__":
     cfg = update_config_from_args(cfg, args)
     
     # Print configuration
-    print("Training configuration:")
-    for key, value in cfg.items():
-        print(f"  {key}: {value}")
+    print("\nTraining configuration:")
+    print("=" * 60)
+    key_configs = ["model_name", "num_bands", "num_classes", "dropout_p", "lr", 
+                   "weight_decay", "batch_size", "epochs", "save_path"]
+    for key in key_configs:
+        if key in cfg:
+            print(f"  {key}: {cfg[key]}")
+    print("=" * 60)
     print()
     
     # Determine data source

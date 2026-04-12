@@ -78,13 +78,13 @@ def load_model_from_checkpoint(
     num_bands: Optional[int] = None,
     num_classes: Optional[int] = None,
     num_contaminants: Optional[int] = None,
+    model_name: Optional[str] = None,
 ) -> torch.nn.Module:
     """
-    Load SoilHSI3DCNN model from a checkpoint file.
+    Load model from a checkpoint file using the model factory.
     
-    Supports multiple checkpoint formats:
-    - Full checkpoint dict with 'model_state_dict', 'optimizer_state_dict', etc.
-    - Simple state dict only
+    Supports multiple checkpoint formats and all model variants (base, se, spectral, deep, hybrid).
+    Automatically detects model variant from checkpoint config if available.
     
     Args:
         checkpoint_path: Path to the .pth checkpoint file
@@ -92,6 +92,7 @@ def load_model_from_checkpoint(
         num_bands: Number of spectral bands (uses default if None)
         num_classes: Number of health classes (uses default if None)
         num_contaminants: Number of contaminant types (uses default if None)
+        model_name: Model variant to use (auto-detected from checkpoint if None)
         
     Returns:
         Loaded model in eval mode on the specified device
@@ -112,27 +113,23 @@ def load_model_from_checkpoint(
     num_contaminants = num_contaminants or len(CONTAMINANT_NAMES)
     
     try:
-        from model import SoilHSI3DCNN
+        from model import create_model, MODEL_VARIANTS
     except ImportError as e:
-        raise RuntimeError(f"Cannot import model.SoilHSI3DCNN: {e}")
-    
-    # Create model
-    model = SoilHSI3DCNN(
-        num_bands=num_bands,
-        num_classes=num_classes,
-        num_contaminants=num_contaminants,
-    )
+        raise RuntimeError(f"Cannot import model factory: {e}")
     
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except Exception as e:
         raise RuntimeError(f"Failed to load checkpoint from {checkpoint_path}: {e}")
     
-    # Extract state dict from various checkpoint formats
+    # Extract state dict and config from various checkpoint formats
     state_dict = None
+    checkpoint_cfg = None
+    
     if isinstance(checkpoint, dict):
         if "model_state_dict" in checkpoint:
             state_dict = checkpoint["model_state_dict"]
+            checkpoint_cfg = checkpoint.get("cfg", {})
             # Log checkpoint metadata if available
             if "best_auc" in checkpoint:
                 print(f"📊 Checkpoint best AUC: {checkpoint['best_auc']:.4f}")
@@ -140,6 +137,7 @@ def load_model_from_checkpoint(
                 print(f"📋 Checkpoint epoch: {checkpoint['epoch']}")
         elif "state_dict" in checkpoint:
             state_dict = checkpoint["state_dict"]
+            checkpoint_cfg = checkpoint.get("cfg", {})
         else:
             # Assume dict itself is the state dict
             state_dict = checkpoint
@@ -148,6 +146,41 @@ def load_model_from_checkpoint(
     
     if state_dict is None:
         raise ValueError("No state dict found in checkpoint")
+    
+    # Determine model variant
+    if model_name is None:
+        # Try to auto-detect from checkpoint config
+        if checkpoint_cfg:
+            model_name = checkpoint_cfg.get("model_name", "base")
+        else:
+            model_name = "base"  # Default fallback
+    
+    if model_name not in MODEL_VARIANTS:
+        print(f"⚠️  Unknown model variant '{model_name}' in checkpoint, falling back to 'base'")
+        model_name = "base"
+    
+    # Extract model-specific kwargs from checkpoint config
+    model_kwargs = {
+        "num_bands": num_bands,
+        "num_classes": num_classes,
+        "num_contaminants": num_contaminants,
+        "bottleneck_dim": MODEL_DEFAULTS.get("bottleneck_dim", 512),
+        "dropout_p": MODEL_DEFAULTS.get("dropout_p", 0.5),
+    }
+    
+    if checkpoint_cfg:
+        model_kwargs["bottleneck_dim"] = checkpoint_cfg.get("bottleneck_dim", model_kwargs["bottleneck_dim"])
+        model_kwargs["dropout_p"] = checkpoint_cfg.get("dropout_p", model_kwargs["dropout_p"])
+        
+        # Add variant-specific kwargs
+        if model_name in ["se", "hybrid"]:
+            model_kwargs["se_reduction"] = checkpoint_cfg.get("se_reduction", 16)
+        if model_name == "deep":
+            model_kwargs["blocks_per_layer"] = checkpoint_cfg.get("blocks_per_layer", 3)
+    
+    # Create model using factory
+    model = create_model(model_name, **model_kwargs)
+    print(f"✅ Created {model_name} model with {sum(p.numel() for p in model.parameters()):,} parameters")
     
     # Load state dict with validation
     try:

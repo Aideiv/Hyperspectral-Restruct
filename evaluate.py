@@ -614,11 +614,6 @@ def main():
     print(f"✅ Test set: {len(test_ds)} samples")
 
     # ── Model ──────────────────────────────────────────────────────────────
-    try:
-        from model import SoilHSI3DCNN
-    except ImportError:
-        sys.exit("❌  Cannot import model.py. Run from the repo root.")
-
     model = load_model(args.checkpoint, device, num_bands)
 
     # ── Inference ──────────────────────────────────────────────────────────

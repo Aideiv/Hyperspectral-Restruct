@@ -34,6 +34,9 @@ CONTAM_THRESHOLD: float = 0.5  # sigmoid threshold for binary contaminant decisi
 # Model Architecture Defaults
 # =============================================================================
 
+# Available model variants
+MODEL_VARIANTS: List[str] = ["base", "se", "spectral", "deep", "hybrid"]
+
 MODEL_DEFAULTS = {
     "num_bands": 200,
     "num_classes": 5,
@@ -41,6 +44,45 @@ MODEL_DEFAULTS = {
     "bottleneck_dim": 512,
     "dropout_p": 0.5,
     "target_size": (64, 64),
+    "model_name": "base",  # Default model variant
+}
+
+# Variant-specific hyperparameter recommendations
+# These adjust based on model capacity to prevent overfitting/underfitting
+MODEL_VARIANT_CONFIGS = {
+    "base": {
+        "dropout_p": 0.5,
+        "lr": 3e-4,
+        "weight_decay": 0.05,
+        "description": "Standard 3D CNN - balanced for most datasets",
+    },
+    "se": {
+        "dropout_p": 0.5,
+        "lr": 3e-4,
+        "weight_decay": 0.05,
+        "se_reduction": 16,
+        "description": "SE-ResNet with channel attention - +3-5% expected accuracy",
+    },
+    "spectral": {
+        "dropout_p": 0.5,
+        "lr": 3e-4,
+        "weight_decay": 0.05,
+        "description": "Spectral attention - best for SWIR-dominant features",
+    },
+    "deep": {
+        "dropout_p": 0.6,  # Higher dropout for larger model
+        "lr": 2e-4,  # Lower LR for stability
+        "weight_decay": 0.1,  # Stronger regularization
+        "blocks_per_layer": 3,
+        "description": "4-layer deep network - for large datasets (>1000 samples)",
+    },
+    "hybrid": {
+        "dropout_p": 0.55,
+        "lr": 2.5e-4,
+        "weight_decay": 0.08,
+        "se_reduction": 16,
+        "description": "Premium architecture - all improvements combined",
+    },
 }
 
 # =============================================================================
@@ -134,3 +176,27 @@ def get_full_config() -> Dict:
         **DEFAULT_PATHS,
         **API_DEFAULTS,
     }
+
+
+def get_model_config(model_name: str) -> Dict:
+    """
+    Returns recommended configuration for a specific model variant.
+    
+    Args:
+        model_name: One of MODEL_VARIANTS
+    
+    Returns:
+        Dictionary with recommended hyperparameters
+    """
+    model_name = model_name.lower()
+    if model_name not in MODEL_VARIANTS:
+        raise ValueError(f"Unknown model: {model_name}. Choose from: {MODEL_VARIANTS}")
+    
+    base_config = {**MODEL_DEFAULTS, **TRAINING_DEFAULTS}
+    variant_config = MODEL_VARIANT_CONFIGS.get(model_name, {})
+    
+    # Merge variant-specific settings
+    result = {**base_config, **variant_config}
+    result["model_name"] = model_name
+    
+    return result
