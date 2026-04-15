@@ -620,7 +620,17 @@ class ModelGlue(nn.Module):
     def encode_continuous(self, logits: torch.Tensor, proj: nn.Linear) -> torch.Tensor:
         """
         Continuous encoding for gradient flow during training.
-        Unlike binary encoding, this preserves gradients.
+        
+        Unlike binary encoding, this preserves gradients by using tanh
+        activation which provides smooth derivatives in the range [-1, 1].
+        This allows backpropagation through the hypervector encoding step.
+        
+        Args:
+            logits: (batch, features) input logits or probabilities
+            proj: Linear projection layer to hv_dim dimensions
+            
+        Returns:
+            (batch, hv_dim) continuous hypervector in range [-1, 1]
         """
         return torch.tanh(proj(logits))  # Continuous in [-1, 1]
     
