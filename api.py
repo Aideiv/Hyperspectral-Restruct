@@ -5,6 +5,7 @@ Provides endpoints for predicting soil nitrogen content from hyperspectral cubes
 and downloading resulting GeoTIFF maps.
 """
 
+import logging
 import os
 import tempfile
 import shutil
@@ -20,6 +21,8 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse
 
 from configs.constants import API_DEFAULTS, NITROGEN_SWIR_BANDS
+
+logger = logging.getLogger(__name__)
 
 # Global session storage for ONNX runtime
 _ort_session: Optional[ort.InferenceSession] = None
@@ -54,7 +57,7 @@ def load_onnx_session(model_path: str) -> ort.InferenceSession:
         # Use CPU execution provider for edge deployment
         providers = ["CPUExecutionProvider"]
         session = ort.InferenceSession(model_path, providers=providers)
-        print(f"✅ Loaded ONNX model from: {model_path}")
+        logger.info(f"Loaded ONNX model from: {model_path}")
         return session
     except Exception as e:
         raise HTTPException(

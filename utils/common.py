@@ -7,6 +7,7 @@ This module provides centralized functions for:
 - Common I/O operations
 """
 
+import logging
 import os
 from pathlib import Path
 from typing import Dict, Optional, Union
@@ -15,6 +16,8 @@ import torch
 import yaml
 
 from configs.constants import HEALTH_LABELS, CONTAMINANT_NAMES, MODEL_DEFAULTS
+
+logger = logging.getLogger(__name__)
 
 
 def load_config(config_path: str = "configs/default.yaml") -> Dict:
@@ -132,9 +135,9 @@ def load_model_from_checkpoint(
             checkpoint_cfg = checkpoint.get("cfg", {})
             # Log checkpoint metadata if available
             if "best_auc" in checkpoint:
-                print(f"📊 Checkpoint best AUC: {checkpoint['best_auc']:.4f}")
+                logger.info(f"Checkpoint best AUC: {checkpoint['best_auc']:.4f}")
             if "epoch" in checkpoint:
-                print(f"📋 Checkpoint epoch: {checkpoint['epoch']}")
+                logger.info(f"Checkpoint epoch: {checkpoint['epoch']}")
         elif "state_dict" in checkpoint:
             state_dict = checkpoint["state_dict"]
             checkpoint_cfg = checkpoint.get("cfg", {})
@@ -156,7 +159,7 @@ def load_model_from_checkpoint(
             model_name = "base"  # Default fallback
     
     if model_name not in MODEL_VARIANTS:
-        print(f"⚠️  Unknown model variant '{model_name}' in checkpoint, falling back to 'base'")
+        logger.warning(f"Unknown model variant '{model_name}' in checkpoint, falling back to 'base'")
         model_name = "base"
     
     # Extract model-specific kwargs from checkpoint config
@@ -180,7 +183,7 @@ def load_model_from_checkpoint(
     
     # Create model using factory
     model = create_model(model_name, **model_kwargs)
-    print(f"✅ Created {model_name} model with {sum(p.numel() for p in model.parameters()):,} parameters")
+    logger.info(f"Created {model_name} model with {sum(p.numel() for p in model.parameters()):,} parameters")
     
     # Load state dict with validation
     try:
@@ -189,7 +192,7 @@ def load_model_from_checkpoint(
         # Try loading with strict=False to see if it's just key mismatch
         try:
             model.load_state_dict(state_dict, strict=False)
-            print(f"⚠️  Loaded checkpoint with strict=False - some keys may be missing or unexpected")
+            logger.warning(f"Loaded checkpoint with strict=False - some keys may be missing or unexpected")
         except RuntimeError:
             raise ValueError(f"Failed to load state dict: {e}")
     

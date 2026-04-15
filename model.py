@@ -1,7 +1,11 @@
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, List
+
+# Setup module logger
+logger = logging.getLogger(__name__)
 
 
 class SEBlock3D(nn.Module):
@@ -1062,9 +1066,11 @@ def create_ensemble_hdc(
 
 # ── Quick sanity check ────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Model Architecture Comparison")
-    print("=" * 60)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    
+    logger.info("=" * 60)
+    logger.info("Model Architecture Comparison")
+    logger.info("=" * 60)
     
     models_to_test = [
         ("base", {}),
@@ -1078,7 +1084,7 @@ if __name__ == "__main__":
     dummy = torch.randn(2, 1, 200, 64, 64)
     
     for name, kwargs in models_to_test:
-        print(f"\n{name.upper()} Model:")
+        logger.info(f"\n{name.upper()} Model:")
         model = create_model(name, num_bands=200, num_classes=5, num_contaminants=4, **kwargs)
         model.eval()
         
@@ -1087,20 +1093,20 @@ if __name__ == "__main__":
         with torch.no_grad():
             health_logits, contam_probs = model(dummy)
         
-        print(f"  Parameters: {total_params:,}")
-        print(f"  Health logits: {health_logits.shape}")
-        print(f"  Contam probs: {contam_probs.shape}")
-        print(f"  Contam range: [{contam_probs.min().item():.3f}, {contam_probs.max().item():.3f}]")
+        logger.info(f"  Parameters: {total_params:,}")
+        logger.info(f"  Health logits: {health_logits.shape}")
+        logger.info(f"  Contam probs: {contam_probs.shape}")
+        logger.info(f"  Contam range: [{contam_probs.min().item():.3f}, {contam_probs.max().item():.3f}]")
         
         # HDC-specific info
         if name == "hdc":
-            print(f"  HV dim: {model.hv_dim}")
-            print(f"  HDC mode: {model.use_hdc}")
+            logger.info(f"  HV dim: {model.hv_dim}")
+            logger.info(f"  HDC mode: {model.use_hdc}")
     
     # Test ensemble HDC
-    print("\n" + "=" * 60)
-    print("ENSEMBLE HDC Model (Gluing Multiple Networks)")
-    print("=" * 60)
+    logger.info("\n" + "=" * 60)
+    logger.info("ENSEMBLE HDC Model (Gluing Multiple Networks)")
+    logger.info("=" * 60)
     
     # Create base models for ensemble
     base_a = create_model("base", num_bands=200, num_classes=5, num_contaminants=4)
@@ -1120,11 +1126,11 @@ if __name__ == "__main__":
     
     total_params = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
     
-    print(f"  Base models: 2 (base + se)")
-    print(f"  Total parameters: {total_params:,}")
-    print(f"  Health logits: {health_logits.shape}")
-    print(f"  Contam probs: {contam_probs.shape}")
-    print(f"  HV dim: {ensemble.hv_dim}")
-    print(f"  Learnable weights: True")
-    print(f"\n  This implements 'gluing neural networks symbolically'")
-    print(f"  via hyperdimensional computing (arXiv:2205.15534)")
+    logger.info(f"  Base models: 2 (base + se)")
+    logger.info(f"  Total parameters: {total_params:,}")
+    logger.info(f"  Health logits: {health_logits.shape}")
+    logger.info(f"  Contam probs: {contam_probs.shape}")
+    logger.info(f"  HV dim: {ensemble.hv_dim}")
+    logger.info(f"  Learnable weights: True")
+    logger.info(f"\n  This implements 'gluing neural networks symbolically'")
+    logger.info(f"  via hyperdimensional computing (arXiv:2205.15534)")

@@ -255,7 +255,7 @@ class HVClassifier(nn.Module):
         self.is_finalized = False
         self.training_mode = True
     
-    def add_examples(self, hvs: torch.Tensor, labels: torch.Tensor):
+    def add_examples(self, hvs: torch.Tensor, labels: torch.Tensor) -> None:
         """
         Accumulate hypervector examples into class hypervectors.
         
@@ -275,7 +275,7 @@ class HVClassifier(nn.Module):
                 self.class_hvs[c] += class_hvs.sum(dim=0)
                 self.class_counts[c] += mask.sum().item()
     
-    def finalize(self):
+    def finalize(self) -> None:
         """
         Binarize class hypervectors after all examples accumulated.
         This converts continuous sums to binary {-1, +1} vectors.
@@ -290,7 +290,7 @@ class HVClassifier(nn.Module):
         self.is_finalized = True
         self.training_mode = False
     
-    def reset(self):
+    def reset(self) -> None:
         """Reset class hypervectors to enable retraining."""
         self.class_hvs.zero_()
         self.class_counts.zero_()
@@ -383,7 +383,7 @@ class ConsensusEnsemble(nn.Module):
         self.models: Dict[str, Tuple[nn.Module, float]] = {}
         self.model_weights = nn.ParameterDict()
     
-    def add_model(self, name: str, model: nn.Module, weight: float = 1.0):
+    def add_model(self, name: str, model: nn.Module, weight: float = 1.0) -> None:
         """
         Register a neural network model for ensemble.
         
@@ -395,7 +395,7 @@ class ConsensusEnsemble(nn.Module):
         self.models[name] = (model, weight)
         self.model_weights[name] = nn.Parameter(torch.tensor(weight))
     
-    def remove_model(self, name: str):
+    def remove_model(self, name: str) -> None:
         """Remove a model from the ensemble."""
         if name in self.models:
             del self.models[name]
@@ -454,7 +454,7 @@ class ConsensusEnsemble(nn.Module):
         return torch.sign(consensus)
     
     @torch.no_grad()
-    def train_encoders(self, dataloader, max_batches: Optional[int] = None):
+    def train_encoders(self, dataloader, max_batches: Optional[int] = None) -> None:
         """
         Train the hypervector encoders by passing data through all registered models.
         
@@ -613,7 +613,7 @@ class ModelGlue(nn.Module):
         self.use_hdc = True
         self.temperature = nn.Parameter(torch.tensor(10.0))  # For soft similarity
     
-    def set_mode(self, use_hdc: bool = True):
+    def set_mode(self, use_hdc: bool = True) -> None:
         """Toggle between HDC and standard classification."""
         self.use_hdc = use_hdc
     
