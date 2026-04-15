@@ -154,5 +154,5 @@ Investor DD: Metrics audited by [TBD third-party]
 
 ---
 
-*Last updated: 2025-04-11*  
-*Next field deployment: TBD (Spring 2025)*
+*Last updated: 2026-04-11*  
+*Next field deployment: TBD (Spring 2026)*

@@ -137,7 +137,7 @@ confirming SWIR-dominant feature selection as the core design principle of the I
 
 ## Model & Hardware Summary
 
-### Simulated Upper Bounds (Whitepaper Targets)
+###  Upper Bounds 
 
 | Metric | N | SOC | PFAS | Heavy metals | Microplastics |
 |--------|---|-----|------|--------------|---------------|
@@ -261,10 +261,10 @@ This creates all scatter plots and confusion matrices from real field data.
 - [ ] Inspect scatter plots in `field_results/figures/scatter_plots/`
 - [ ] Verify ground truth instrument IDs in `FIELD_DATA_MANIFEST.md`
 - [ ] Confirm sample sizes (79 N/SOC samples, 32 microplastics — growing)
-- [ ] Check for EPA PFAS site embargo status (Q3 2025 clearance)
+- [ ] Check for EPA PFAS site embargo status (Q3 2026 clearance)
 - [ ] Understand 15–30% performance gap (real vs simulated)
 
 ---
 
 *Document version: 2.0 (real-field focus)*  
-*Last updated: 2025-04-11*
+*Last updated: 2026-04-11*

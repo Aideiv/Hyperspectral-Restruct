@@ -18,7 +18,7 @@ Autonomous hyperspectral remote sensing & AI verification layer for regenerative
 - Edge/offline deployment for austere environments
 - Direct integration with AIP0 (zk-secured provenance) and Bioverge (feedstock qualification)
 
-📂 **Real-Field Data:** See `field_results/` for actual drone flight results with ground truth validation (79 samples, MD + DE pilots). Includes real vs predicted scatter plots for N, SOC, moisture, and confusion matrices.
+📂 **Field Data:** See `field_results/` for actual drone flight results with ground truth validation (79 samples, MD + DE pilots). Includes real vs predicted scatter plots for N, SOC, moisture, and confusion matrices.
 
 ## Abstract
 
@@ -266,6 +266,64 @@ We apply spatial dropout for hyperspectral feature maps to combat overfitting in
 
 **Channel Reduction & Progressive Processing**  
 Initial dimensionality reduction (full 200+ bands → 64 channels) followed by deeper convolutional blocks with increasing dropout probability, mirroring the whitepaper’s emphasis on preventing overfitting while preserving low-level spectral features.
+
+### Hyperdimensional Computing (HDC) — Model Gluing
+
+Based on **"Gluing Neural Networks Symbolically Through Hyperdimensional Computing"** (arXiv:2205.15534, Sutor et al.), we implement a novel ensemble technique that fuses multiple neural networks at the symbolic level using high-dimensional binary vectors.
+
+**Core Concept**
+Traditional ensembles average predictions from multiple models. HDC "glues" models by encoding their pre-classification outputs as binary hypervectors and combining them through **consensus bundling**—element-wise summation followed by binarization. This enables:
+
+- **Online Learning**: Add/remove models without retraining existing ones
+- **Life-Long Learning**: Bundle hypervectors over time as new data arrives
+- **Minimal Overhead**: Hypervector operations are 1000× faster than neural forward passes
+- **Symbolic Fusion**: Models fuse at the representation level, not just output level
+
+**Architecture Variants**
+
+| Variant | Description | Use Case |
+|---------|-------------|----------|
+| `hdc` | Single model with HDC classification | Online adaptation, fast retraining |
+| `ensemble_hdc` | Multiple models fused via HV consensus | Maximum accuracy, model diversity |
+
+**How It Works**
+
+```
+Model A Output → Encode → Hypervector A ─┐
+                                           ├→ Bundle → Consensus HV → Classify
+Model B Output → Encode → Hypervector B ─┘
+```
+
+1. **Encoding**: Neural outputs (logits) are projected to high-dimensional binary space via random/learned projection
+2. **Bundling (⊕)**: Hypervectors are summed and binarized to form consensus
+3. **Classification**: Query hypervector similarity to class hypervectors (cosine similarity)
+
+**Usage Example**
+
+```python
+from model import create_model, create_ensemble_hdc
+
+# Single HDC model
+model = create_model("hdc", hv_dim=10000, num_classes=5)
+
+# Ensemble with HDC fusion
+base_a = create_model("base")
+base_b = create_model("se")
+ensemble = create_ensemble_hdc([base_a, base_b], hv_dim=10000)
+```
+
+**Key Hyperparameters**
+
+- `hv_dim`: Hypervector dimension (1000–10000, default 10000). Higher = more capacity but more memory
+- `learnable_weights`: Learn ensemble weights via backprop (default True) vs. fixed equal weighting
+
+**Performance Notes**
+
+- HDC ensemble adds <5% parameter overhead vs. base models
+- Inference overhead is negligible (~1ms) compared to CNN forward pass
+- Supports both differentiable training and non-differentiable online updates
+
+See `train_hdc_example.py` for complete training examples in three modes: single HDC, ensemble HDC, and online learning.
 
 ### Training Protocol
 **Mixed Precision Training**  

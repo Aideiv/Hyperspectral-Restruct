@@ -35,7 +35,7 @@ CONTAM_THRESHOLD: float = 0.5  # sigmoid threshold for binary contaminant decisi
 # =============================================================================
 
 # Available model variants
-MODEL_VARIANTS: List[str] = ["base", "se", "spectral", "deep", "hybrid"]
+MODEL_VARIANTS: List[str] = ["base", "se", "spectral", "deep", "hybrid", "hdc", "ensemble_hdc"]
 
 MODEL_DEFAULTS = {
     "num_bands": 200,
@@ -82,6 +82,22 @@ MODEL_VARIANT_CONFIGS = {
         "weight_decay": 0.08,
         "se_reduction": 16,
         "description": "Premium architecture - all improvements combined",
+    },
+    "hdc": {
+        "dropout_p": 0.5,
+        "lr": 3e-4,
+        "weight_decay": 0.05,
+        "hv_dim": 10000,
+        "use_hdc": True,
+        "description": "Hyperdimensional Computing - enables online learning and model fusion",
+    },
+    "ensemble_hdc": {
+        "dropout_p": 0.5,
+        "lr": 3e-4,
+        "weight_decay": 0.05,
+        "hv_dim": 10000,
+        "learnable_weights": True,
+        "description": "Ensemble with HDC fusion - glue multiple models symbolically",
     },
 }
 
@@ -200,3 +216,51 @@ def get_model_config(model_name: str) -> Dict:
     result["model_name"] = model_name
     
     return result
+
+
+def get_hdc_config(hv_dim: int = 10000, use_hdc: bool = True) -> Dict:
+    """
+    Returns configuration for Hyperdimensional Computing models.
+    
+    Args:
+        hv_dim: Hypervector dimension (typically 1000-10000)
+        use_hdc: Whether to use HDC classification (vs standard)
+    
+    Returns:
+        Dictionary with HDC-specific configuration
+    """
+    return {
+        "hv_dim": hv_dim,
+        "use_hdc": use_hdc,
+        "description": f"HDC with {hv_dim}D hypervectors",
+    }
+
+
+def get_ensemble_hdc_config(
+    base_models: List[str] = None,
+    hv_dim: int = 10000,
+    learnable_weights: bool = True,
+) -> Dict:
+    """
+    Returns configuration for HDC Ensemble (model gluing).
+    
+    Implements the technique from arXiv:2205.15534:
+    "Gluing Neural Networks Symbolically Through Hyperdimensional Computing"
+    
+    Args:
+        base_models: List of base model names to fuse (e.g., ["base", "se"])
+        hv_dim: Hypervector dimension for consensus
+        learnable_weights: Whether to learn ensemble weights via backprop
+    
+    Returns:
+        Dictionary with ensemble HDC configuration
+    """
+    if base_models is None:
+        base_models = ["base", "se"]
+    
+    return {
+        "base_models": base_models,
+        "hv_dim": hv_dim,
+        "learnable_weights": learnable_weights,
+        "description": f"HDC Ensemble gluing {len(base_models)} models with {hv_dim}D consensus",
+    }

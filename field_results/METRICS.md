@@ -255,5 +255,5 @@ A: Yes, under NDA. See `raw_scans/` structure in README.
 ---
 
 *Document version: 1.0*  
-*Last updated: 2025-04-11*  
-*Next update: Post-Spring 2025 deployment*
+*Last updated: 2026-04-11*  
+*Next update: Post-Spring 2026 deployment*

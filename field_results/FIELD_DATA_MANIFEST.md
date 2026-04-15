@@ -205,4 +205,4 @@ raw_scans/2025-01_pfas_sites/
 
 ---
 
-*Next update: Post-Spring 2025 deployments*
+*Next update: Post-Spring 2026 deployments*
