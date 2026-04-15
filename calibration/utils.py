@@ -354,7 +354,7 @@ def calculate_spectral_indices(data: np.ndarray,
             nir = data[:, :, nir_band]
             ndvi = (nir - red) / (nir + red + 1e-10)
             indices['NDVI'] = ndvi
-    except:
+    except Exception:
         pass
     
     # NDRE (Normalized Difference Red Edge Index)
@@ -367,7 +367,7 @@ def calculate_spectral_indices(data: np.ndarray,
             nir = data[:, :, nir_band]
             ndre = (nir - red_edge) / (nir + red_edge + 1e-10)
             indices['NDRE'] = ndre
-    except:
+    except Exception:
         pass
     
     # WDRVI (Wide Dynamic Range Vegetation Index)
@@ -381,7 +381,7 @@ def calculate_spectral_indices(data: np.ndarray,
             alpha = 0.2  # Expansion factor
             wdrvi = (alpha * nir - red) / (alpha * nir + red + 1e-10)
             indices['WDRVI'] = wdrvi
-    except:
+    except Exception:
         pass
     
     return indices
