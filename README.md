@@ -1,7 +1,7 @@
 *Hyperspectral Soil Spectrum*
 **Enotrium // Agri-Intelligence**
  
-# Hyperspectral CNN for soil chemistry prediction.
+# Hyperspectral Modeling for soil chemistry prediction.
 
 ### Use hyperspectral drones to predict soil chemistry instantly. This data determines what gets grown, contracted, and turned into industrial materials. The Icarus Model processes drone-captured spectral data to estimate soil composition and is deployed in Enotrium’s pipeline to contract farms and optimize cash crop economics.
 
