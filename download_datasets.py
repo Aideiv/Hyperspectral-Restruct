@@ -29,9 +29,7 @@ DATASETS = {
     "munsell": {
         "name": "Munsell Soil Color Chart HSI Dataset",
         "urls": [
-            "https://zenodo.org/records/8143355/files/munsell_soil_color_chips.zip?download=1",
-            "https://zenodo.org/records/8143355/files/munsell_soil_full_scenes.zip?download=1",
-            "https://zenodo.org/records/8143355/files/munsell_soil_endmembers.zip?download=1"
+            "https://zenodo.org/records/8267346",
         ],
         "target_dir": "data/munsell_soil_color",
         "description": "204 bands (397–1003 nm), 20×20 chips + full scenes + endmembers",
@@ -41,9 +39,7 @@ DATASETS = {
         "name": "Database of Hyperspectral Images of Phosphorus in Soil",
         "urls": [
             # Note: These are placeholder URLs - actual Mendeley URLs need to be updated
-            "https://data.mendeley.com/public-files/datasets/phosphorus_hsi_part1.zip",
-            "https://data.mendeley.com/public-files/datasets/phosphorus_hsi_part2.zip",
-            "https://data.mendeley.com/public-files/datasets/phosphorus_chemical_data.csv"
+            "https://data.mendeley.com/datasets/fvgswvt5ws/3",
         ],
         "target_dir": "data/phosphorus_soil",
         "description": "152 lab samples, 145 bands (420–1000 nm), Bayspec OCIF push-broom",
@@ -52,8 +48,7 @@ DATASETS = {
     "indian_pines": {
         "name": "Indian Pines AVIRIS Dataset (Site 3)",
         "urls": [
-            # Note: Actual Purdue URL needs to be updated
-            "https://purr.purdue.edu/downloads/indian_pines_site3.zip"
+            "https://purr.purdue.edu/publications/1947/about?v=1"
         ],
         "target_dir": "data/indian_pines_site3",
         "description": "220 bands (400–2500 nm), ~20m resolution, 2×2 mile area",
