@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from sklearn.model_selection import train_test_split
@@ -24,7 +23,7 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 
 from model import create_model
-from dataset import HyperspectralSoilDataset, HyperspectralTransform
+from dataset import HyperspectralSoilDataset, HyperspectralTransform, Hyperview2Dataset
 from configs.constants import (
     CONTAMINANT_NAMES,
     MODEL_DEFAULTS,
@@ -258,6 +257,58 @@ def create_dataloaders_from_dataset(
     return train_loader, val_loader
 
 
+def create_hyperview2_dataloaders(
+    data_dir: str,
+    labels_file: str,
+    cfg: dict,
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Create train and validation dataloaders from HYPERVIEW2 Challenge data.
+
+    Args:
+        data_dir:    Directory containing per-patch .npz files.
+        labels_file: CSV with columns: patch_id, K, Mg, P2O5, pH.
+        cfg:         Configuration dictionary.
+
+    Returns:
+        Tuple of (train_loader, val_loader)
+    """
+    import pandas as pd
+
+    df = pd.read_csv(labels_file)
+    indices = list(range(len(df)))
+    np.random.seed(DATA_DEFAULTS["random_seed"])
+    np.random.shuffle(indices)
+    split = int(np.floor(DATA_DEFAULTS["train_val_split"] * len(df)))
+    train_idx, val_idx = indices[split:], indices[:split]
+
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    val_df   = df.iloc[val_idx].reset_index(drop=True)
+
+    # Write temporary CSVs so Hyperview2Dataset can read them
+    import tempfile, os
+    tmp = tempfile.mkdtemp()
+    train_csv = os.path.join(tmp, "train.csv")
+    val_csv   = os.path.join(tmp, "val.csv")
+    train_df.to_csv(train_csv, index=False)
+    val_df.to_csv(val_csv,   index=False)
+
+    num_bands = cfg.get("num_bands", 150)
+    target_size = tuple(cfg.get("target_size", MODEL_DEFAULTS["target_size"]))
+
+    train_ds = Hyperview2Dataset(data_dir, train_csv, num_bands=num_bands,
+                                 target_size=target_size, train=True)
+    val_ds   = Hyperview2Dataset(data_dir, val_csv,   num_bands=num_bands,
+                                 target_size=target_size, train=False)
+
+    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,
+                              num_workers=cfg["num_workers"], pin_memory=True, drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"], shuffle=False,
+                              num_workers=cfg["num_workers"], pin_memory=True)
+
+    return train_loader, val_loader
+
+
 class DummyDataset(Dataset):
     """Simple dataset for testing with synthetic hyperspectral data."""
     
@@ -341,39 +392,43 @@ def create_dummy_dataloaders(cfg: dict) -> Tuple[DataLoader, DataLoader]:
     return train_loader, val_loader
 
 
-def train(cfg: dict, resume_path: str = None, data_dir: str = None, labels_file: str = None):
+def train(cfg: dict, resume_path: str = None, data_dir: str = None,
+          labels_file: str = None, dataset_type: str = "generic"):
     """
     Main training function with optional resume capability.
-    
+
     Args:
-        cfg: Configuration dictionary
-        resume_path: Path to checkpoint to resume from (optional)
-        data_dir: Directory containing hyperspectral data (if None, uses dummy data)
-        labels_file: Path to labels CSV file (required if data_dir is provided)
+        cfg:          Configuration dictionary.
+        resume_path:  Path to checkpoint to resume from (optional).
+        data_dir:     Directory containing hyperspectral data.
+        labels_file:  Path to labels CSV file.
+        dataset_type: One of "hyperview2", "generic", or "dummy".
     """
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Training on: {device}")
-        
-        # Validate configuration
-        required_keys = ["num_bands", "num_classes", "num_contaminants", "batch_size", 
-                         "epochs", "lr", "weight_decay", "contam_loss_weight", 
-                         "label_smoothing", "cosine_T0", "cosine_T_mult", "grad_clip", 
+
+        required_keys = ["num_bands", "num_classes", "num_contaminants", "batch_size",
+                         "epochs", "lr", "weight_decay", "contam_loss_weight",
+                         "label_smoothing", "cosine_T0", "cosine_T_mult", "grad_clip",
                          "num_workers", "save_path"]
-        
         for key in required_keys:
             if key not in cfg:
                 raise ValueError(f"Missing required configuration key: {key}")
-        
-        # Create dataloaders - real data if paths provided, else dummy data
-        if data_dir and labels_file:
-            print(f"Loading real data from: {data_dir}")
+
+        # Create dataloaders
+        if dataset_type == "hyperview2":
+            if not data_dir or not labels_file:
+                raise ValueError("--data_dir and --labels_file are required for --dataset hyperview2")
+            print(f"Loading HYPERVIEW2 data from: {data_dir}")
+            train_loader, val_loader = create_hyperview2_dataloaders(data_dir, labels_file, cfg)
+        elif dataset_type == "generic" and data_dir and labels_file:
+            print(f"Loading generic HSI data from: {data_dir}")
             train_transform = HyperspectralTransform(
                 target_size=tuple(cfg.get("target_size", MODEL_DEFAULTS["target_size"]))
             )
             val_transform = HyperspectralTransform(
                 target_size=tuple(cfg.get("target_size", MODEL_DEFAULTS["target_size"])),
-                # Disable augmentation for validation
                 flip_prob=0.0,
                 elastic_prob=0.0,
                 crop_resize_prob=0.0,
@@ -414,7 +469,7 @@ def train(cfg: dict, resume_path: str = None, data_dir: str = None, labels_file:
 
         optimizer  = AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
         scheduler  = CosineAnnealingWarmRestarts(optimizer, T_0=cfg["cosine_T0"], T_mult=cfg["cosine_T_mult"])
-        scaler     = GradScaler()
+        scaler     = torch.amp.GradScaler("cuda" if torch.cuda.is_available() else "cpu")
         ce_criterion = nn.CrossEntropyLoss(label_smoothing=cfg["label_smoothing"])
 
         # Resume from checkpoint if provided
@@ -447,7 +502,7 @@ def train(cfg: dict, resume_path: str = None, data_dir: str = None, labels_file:
 
                 optimizer.zero_grad()
 
-                with autocast():
+                with torch.amp.autocast("cuda" if torch.cuda.is_available() else "cpu"):
                     pred_health, pred_contam = model(cube)
                     # FIX 1 — weighted loss; contam_loss_weight is a tunable scalar
                     loss, ce_loss, bce_loss = compute_loss(
@@ -550,8 +605,10 @@ def parse_args():
     parser.add_argument("--dropout", type=float, help="Dropout probability (overrides config)")
     parser.add_argument("--calibrate", action="store_true", help="Enable radiometric calibration")
     parser.add_argument("--calib_config", type=str, help="Path to calibration config file")
-    parser.add_argument("--data_dir", type=str, help="Directory containing hyperspectral data (.npy or .hdr files)")
-    parser.add_argument("--labels_file", type=str, help="Path to labels CSV file (required if --data_dir is provided)")
+    parser.add_argument("--data_dir", type=str, help="Directory containing hyperspectral data (.npz or .npy files)")
+    parser.add_argument("--labels_file", type=str, help="Path to labels CSV file")
+    parser.add_argument("--dataset", type=str, choices=["hyperview2", "generic", "dummy"],
+                        default="dummy", help="Dataset type to use for training (default: dummy)")
     parser.add_argument("--use_dummy", action="store_true", help="Use dummy data for testing (ignores data_dir)")
     parser.add_argument("--list_models", action="store_true", help="List available model variants and exit")
     return parser.parse_args()
@@ -615,9 +672,9 @@ if __name__ == "__main__":
             print(f"  Recommended dropout: {config.get('dropout_p', 0.5)}")
         print("\n" + "=" * 60)
         print("\nUsage examples:")
-        print("  python train.py --model se --epochs 100")
-        print("  python train.py --model hybrid --lr 2.5e-4 --dropout 0.55")
-        print("  python train.py --model deep --data_dir ./data --labels_file labels.csv")
+        print("  python train.py --dataset dummy --model se --epochs 100")
+        print("  python train.py --dataset hyperview2 --data_dir ./data/hyperview2 --labels_file ./data/hyperview2/train_labels.csv")
+        print("  python train.py --dataset hyperview2 --model se --data_dir ./data/hyperview2 --labels_file ./data/hyperview2/train_labels.csv")
         exit(0)
     
     # Load configuration
@@ -642,13 +699,19 @@ if __name__ == "__main__":
     print("=" * 60)
     print()
     
-    # Determine data source
-    data_dir = None if args.use_dummy else args.data_dir
-    labels_file = None if args.use_dummy else args.labels_file
-    
+    # Determine dataset type and data sources
+    dataset_type = "dummy" if args.use_dummy else args.dataset
+    data_dir     = None if dataset_type == "dummy" else args.data_dir
+    labels_file  = None if dataset_type == "dummy" else args.labels_file
+
+    # HYPERVIEW2 uses 150 bands — override default 200 unless user set it explicitly
+    if dataset_type == "hyperview2" and cfg.get("num_bands") == MODEL_DEFAULTS["num_bands"]:
+        cfg["num_bands"] = 150
+
     # Validate data arguments
-    if data_dir and not labels_file:
-        parser.error("--labels_file is required when --data_dir is provided")
-    
+    if dataset_type != "dummy" and not (data_dir and labels_file):
+        parser.error("--data_dir and --labels_file are required unless --dataset dummy")
+
     # Start training
-    train(cfg, resume_path=args.resume, data_dir=data_dir, labels_file=labels_file)
+    train(cfg, resume_path=args.resume, data_dir=data_dir, labels_file=labels_file,
+          dataset_type=dataset_type)
