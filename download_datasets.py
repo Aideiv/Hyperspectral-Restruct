@@ -2,15 +2,10 @@
 """
 download_datasets.py - Automated downloader for hyperspectral soil datasets.
 
-Downloads and sets up the key hyperspectral datasets mentioned in HSI_Datasets.md:
-1. Munsell Soil Color Chart Hyperspectral Dataset (Zenodo)
-2. Database of Hyperspectral Images of Phosphorus in Soil (Mendeley)
-3. Indian Pines AVIRIS Dataset (Site 3) (Purdue)
-4. SPECCHIO spectral libraries (bonus)
+Downloads and sets up the HYPERVIEW2 hyperspectral soil dataset.
 
 Usage:
-    python download_datasets.py --dataset munsell
-    python download_datasets.py --dataset all
+    python download_datasets.py --dataset hyperview2
     python download_datasets.py --list
 """
 
@@ -22,38 +17,18 @@ import requests
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Dict, List, Optional
-import subprocess
 
 # Dataset configurations
 DATASETS = {
-    "munsell": {
-        "name": "Munsell Soil Color Chart HSI Dataset",
+    "hyperview2": {
+        "name": "HYPERVIEW2 (AI4EO Challenge)",
         "urls": [
-            "https://zenodo.org/records/8267346",
+            "https://www.eotdl.com/datasets/HYPERVIEW2",
         ],
-        "target_dir": "data/munsell_soil_color",
-        "description": "204 bands (397–1003 nm), 20×20 chips + full scenes + endmembers",
-        "size_info": "chips (~68 MB), scenes (~2.1 GB), endmembers (~328 KB)"
+        "target_dir": "data/hyperview2",
+        "description": "~150 bands VNIR-SWIR, airborne HSI patches over Polish agricultural fields with soil parameter ground truth (K, P₂O₅, Mg, pH)",
+        "size_info": "~312 MB"
     },
-    "phosphorus": {
-        "name": "Database of Hyperspectral Images of Phosphorus in Soil",
-        "urls": [
-            # Note: These are placeholder URLs - actual Mendeley URLs need to be updated
-            "https://data.mendeley.com/datasets/fvgswvt5ws/3",
-        ],
-        "target_dir": "data/phosphorus_soil",
-        "description": "152 lab samples, 145 bands (420–1000 nm), Bayspec OCIF push-broom",
-        "size_info": "~3 GB total across multiple ZIPs"
-    },
-    "indian_pines": {
-        "name": "Indian Pines AVIRIS Dataset (Site 3)",
-        "urls": [
-            "https://purr.purdue.edu/publications/1947/about?v=1"
-        ],
-        "target_dir": "data/indian_pines_site3",
-        "description": "220 bands (400–2500 nm), ~20m resolution, 2×2 mile area",
-        "size_info": "Large-scale airborne scene"
-    }
 }
 
 def create_directories() -> None:
@@ -158,22 +133,6 @@ def list_datasets() -> None:
         print(f"   💾 {dataset['size_info']}")
         print(f"   📁 Target: {dataset['target_dir']}")
 
-def setup_git_lfs() -> bool:
-    """Set up Git LFS for large files."""
-    try:
-        # Check if git lfs is installed
-        result = subprocess.run(['git', 'lfs', 'version'], 
-                              capture_output=True, text=True)
-        if result.returncode != 0:
-            print("⚠️  Git LFS not found. Installing...")
-            # Try to install git lfs
-            subprocess.run(['git', 'lfs', 'install'], check=True)
-        
-        print("✅ Git LFS is available")
-        return True
-    except Exception as e:
-        print(f"⚠️  Git LFS setup failed: {e}")
-        return False
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -182,44 +141,28 @@ def main() -> None:
         epilog="""
 Examples:
   python download_datasets.py --list
-  python download_datasets.py --dataset munsell
-  python download_datasets.py --dataset all
+  python download_datasets.py --dataset hyperview2
         """
     )
     
-    parser.add_argument("--dataset", choices=list(DATASETS.keys()) + ["all"],
+    parser.add_argument("--dataset", choices=list(DATASETS.keys()),
                        help="Dataset to download")
     parser.add_argument("--list", action="store_true",
                        help="List all available datasets")
-    parser.add_argument("--setup-lfs", action="store_true",
-                       help="Set up Git LFS for large files")
-    
     args = parser.parse_args()
-    
+
     # Create necessary directories
     create_directories()
-    
+
     if args.list:
         list_datasets()
         return
-    
-    if args.setup_lfs:
-        setup_git_lfs()
-        return
-    
+
     if not args.dataset:
         parser.print_help()
         return
     
-    if args.dataset == "all":
-        print("🚀 Downloading all datasets...")
-        success_count = 0
-        for dataset_name in DATASETS.keys():
-            if download_dataset(dataset_name):
-                success_count += 1
-        print(f"\n📊 Summary: {success_count}/{len(DATASETS)} datasets downloaded successfully")
-    else:
-        download_dataset(args.dataset)
+    download_dataset(args.dataset)
 
 if __name__ == "__main__":
     main()

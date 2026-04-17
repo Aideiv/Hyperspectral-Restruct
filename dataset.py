@@ -665,6 +665,128 @@ class HyperspectralSoilDataset(Dataset):
         }
 
 
+# ── HYPERVIEW2 Dataset ────────────────────────────────────────────────────────
+
+class Hyperview2Dataset(Dataset):
+    """
+    Dataset for HYPERVIEW2 Challenge patches.
+
+    Expected layout:
+        data_dir/
+            <patch_id>.npz   — one file per patch, array shape (H, W, C) or (C, H, W)
+        labels_csv           — columns: patch_id, K, Mg, P2O5, pH
+
+    Label mapping:
+        Health class (0–4) is derived from a composite soil health score built
+        by scoring each parameter against agronomic optimal ranges, averaging
+        across all four parameters, then percentile-binning into five classes.
+        Contaminant labels are all zeros (HYPERVIEW2 has no contaminant GT).
+    """
+
+    # Agronomic optimal ranges used for per-parameter scoring
+    _OPTIMA = {
+        "K":    (150.0, 250.0),
+        "Mg":   (100.0, 200.0),
+        "P2O5": (40.0,  80.0),
+        "pH":   (6.0,   7.0),
+    }
+
+    def __init__(
+        self,
+        data_dir: str,
+        labels_csv: str,
+        num_bands: int = 150,
+        target_size: tuple = (64, 64),
+        train: bool = True,
+    ):
+        import pandas as pd
+
+        self.data_dir = Path(data_dir)
+        self.num_bands = num_bands
+        self.target_size = target_size
+        self.transform = HyperspectralTransform(target_size) if train else None
+
+        df = pd.read_csv(labels_csv)
+
+        scores = self._compute_health_scores(df)
+        health_classes = self._bin_scores(scores)
+
+        self.patch_ids = df["patch_id"].tolist()
+        self.health_classes = health_classes
+        self.contam_labels = [[0.0, 0.0, 0.0, 0.0]] * len(df)
+
+        print(f"📊 Hyperview2Dataset: {len(self.patch_ids)} patches, "
+              f"health class distribution: {np.bincount(health_classes).tolist()}")
+
+    def _compute_health_scores(self, df) -> np.ndarray:
+        """
+        Score 0–1 per parameter (1.0 = inside optimal range, decreasing
+        linearly outside), then average across all four parameters.
+        """
+        scores = np.zeros(len(df), dtype=np.float32)
+        n_params = 0
+        for col, (lo, hi) in self._OPTIMA.items():
+            if col not in df.columns:
+                continue
+            vals = df[col].to_numpy(dtype=np.float32)
+            param_score = np.ones_like(vals)
+            below = vals < lo
+            above = vals > hi
+            param_score[below] = vals[below] / lo
+            param_score[above] = hi / np.maximum(vals[above], 1e-8)
+            scores += param_score
+            n_params += 1
+        return scores / max(n_params, 1)
+
+    def _bin_scores(self, scores: np.ndarray) -> List[int]:
+        """Bin composite scores into 5 health classes via percentile cuts."""
+        thresholds = np.percentile(scores, [20, 40, 60, 80])
+        classes = np.zeros(len(scores), dtype=int)
+        for i, t in enumerate(thresholds):
+            classes[scores > t] = i + 1
+        return classes.tolist()
+
+    def __len__(self) -> int:
+        return len(self.patch_ids)
+
+    def __getitem__(self, idx: int):
+        patch_path = self.data_dir / f"{self.patch_ids[idx]}.npz"
+        data = np.load(patch_path)
+        key = list(data.keys())[0]
+        cube = data[key].astype(np.float32)
+
+        # Ensure (C, H, W) — HYPERVIEW2 patches are typically (H, W, C)
+        if cube.ndim == 3 and cube.shape[2] < cube.shape[0]:
+            cube = cube.transpose(2, 0, 1)
+
+        # Resample to target band count if needed
+        if cube.shape[0] != self.num_bands:
+            cube = zoom(cube, (self.num_bands / cube.shape[0], 1, 1), order=1)
+
+        # Spatial resize (transform handles it when training)
+        if self.transform is None:
+            H, W = cube.shape[1], cube.shape[2]
+            tH, tW = self.target_size
+            if (H, W) != (tH, tW):
+                cube = zoom(cube, (1, tH / H, tW / W), order=1)
+
+        if self.transform is not None:
+            cube = self.transform(cube)
+
+        # Band-wise z-score normalisation
+        mean = cube.mean(axis=(1, 2), keepdims=True)
+        std  = cube.std(axis=(1, 2), keepdims=True) + 1e-8
+        cube = (cube - mean) / std
+
+        cube_t = torch.from_numpy(cube).unsqueeze(0)  # (1, C, H, W)
+
+        return (
+            cube_t,
+            torch.tensor(self.health_classes[idx], dtype=torch.long),
+            torch.tensor(self.contam_labels[idx], dtype=torch.float32),
+        )
+
+
 # ── Quick sanity check ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import tempfile, os

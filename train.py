@@ -1,654 +1,497 @@
 """
-Training script for SoilHSI3DCNN model.
+train.py — Icarus: Hyperspectral Soil CNN
+Trains a 3D CNN on HYPERVIEW2 patches loaded via its STAC catalog.
 
-Supports training from scratch, resuming from checkpoints, and both
-dummy data (for testing) and real HyperspectralSoilDataset loading.
+Usage:
+    # Step 1 — download patches from catalog (only needed once)
+    python train.py --prepare --catalog /root/.cache/eotdl/datasets/HYPERVIEW2/catalog.v2.parquet --data_dir ./data/hyperview2
+
+    # Step 2 — train
+    python train.py --data_dir ./data/hyperview2
+
+    # Quick smoke test (no data needed)
+    python train.py --dummy
 """
 
+import argparse
+import os
+import warnings
+from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-from torch.cuda.amp import GradScaler, autocast
+from scipy.ndimage import zoom
+from sklearn.metrics import roc_auc_score
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
-import numpy as np
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-import warnings
-import argparse
-import json
-import os
-from pathlib import Path
-from typing import Optional, Tuple, List
 
-from model import create_model
-from dataset import HyperspectralSoilDataset, HyperspectralTransform
 from configs.constants import (
     CONTAMINANT_NAMES,
-    MODEL_DEFAULTS,
-    TRAINING_DEFAULTS,
-    DATA_DEFAULTS,
     DEFAULT_PATHS,
+    HEALTH_LABELS,
+    MODEL_DEFAULTS,
     MODEL_VARIANTS,
-    get_full_config,
+    TRAINING_DEFAULTS,
     get_model_config,
 )
-
+from model import create_model
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-# Build default config from centralized constants
-CFG = get_full_config()
-CFG["save_path"] = DEFAULT_PATHS["save_path"]  # Override with specific path
+CFG = {
+    **MODEL_DEFAULTS,
+    **TRAINING_DEFAULTS,
+    "save_path": DEFAULT_PATHS["save_path"],
+    "num_bands": 150,       # HYPERVIEW2: ~150 VNIR bands
+    "num_workers": 4,
+}
 
+# ── Data preparation ──────────────────────────────────────────────────────────
 
-# ── Loss helpers ──────────────────────────────────────────────────────────────
-
-def compute_loss(
-    pred_health: torch.Tensor,
-    pred_contam: torch.Tensor,
-    health: torch.Tensor,
-    contam: torch.Tensor,
-    ce_criterion: nn.CrossEntropyLoss,
-    contam_weight: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def parse_catalog(catalog_path: str) -> pd.DataFrame:
     """
-    Returns (total_loss, ce_loss, bce_loss).
-
-    FIX 1 — losses are kept separate so per-task magnitudes can be logged
-    and the weighting hyperparameter `contam_weight` is explicit.
+    Read the STAC catalog parquet and return a DataFrame with columns:
+        id, href
+    one row per file in the dataset.
     """
-    ce_loss  = ce_criterion(pred_health, health)
+    df = pd.read_parquet(catalog_path)
+    records = []
+    for _, row in df.iterrows():
+        assets = row.get("assets", {})
+        if isinstance(assets, dict):
+            asset = assets.get("asset", {})
+            href = asset.get("href", "")
+            records.append({"id": row["id"], "href": href})
+    return pd.DataFrame(records)
+
+
+def download_file(url: str, dest: Path, chunk_size: int = 8192) -> bool:
+    """Download a single file with a progress bar."""
+    try:
+        r = requests.get(url, stream=True, timeout=30)
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        with open(dest, "wb") as f, tqdm(
+            total=total, unit="B", unit_scale=True,
+            desc=dest.name, leave=False
+        ) as bar:
+            for chunk in r.iter_content(chunk_size):
+                f.write(chunk)
+                bar.update(len(chunk))
+        return True
+    except Exception as e:
+        print(f"  Failed {dest.name}: {e}")
+        return False
+
+
+def prepare_data(catalog_path: str, data_dir: str) -> None:
+    """
+    Parse the STAC catalog and download all patch files + train_gt.csv
+    into data_dir. Skips files that already exist.
+    """
+    out = Path(data_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    catalog = parse_catalog(catalog_path)
+    print(f"Catalog has {len(catalog)} entries.")
+
+    for _, row in tqdm(catalog.iterrows(), total=len(catalog), desc="Downloading"):
+        file_id = row["id"]
+        href    = row["href"]
+        dest    = out / file_id
+
+        if dest.exists():
+            continue
+        if not href:
+            print(f"  No href for {file_id} — skipping.")
+            continue
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        download_file(href, dest)
+
+    print(f"\nData ready at: {data_dir}")
+
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+
+# Agronomic optimal ranges for composite soil health scoring
+_OPTIMA = {
+    "K":    (150.0, 250.0),
+    "Mg":   (100.0, 200.0),
+    "P2O5": (40.0,  80.0),
+    "pH":   (6.0,   7.0),
+}
+
+
+def chemistry_to_health_class(df: pd.DataFrame) -> List[int]:
+    """
+    Map K/Mg/P2O5/pH values to health classes 0–4.
+    Each parameter is scored 0–1 (1 = inside optimal range),
+    scores are averaged, then percentile-binned into 5 classes.
+    """
+    scores = np.zeros(len(df), dtype=np.float32)
+    n = 0
+    for col, (lo, hi) in _OPTIMA.items():
+        if col not in df.columns:
+            continue
+        vals = df[col].to_numpy(dtype=np.float32)
+        s = np.ones_like(vals)
+        s[vals < lo] = vals[vals < lo] / lo
+        above = vals > hi
+        s[above] = hi / np.maximum(vals[above], 1e-8)
+        scores += s
+        n += 1
+
+    if n == 0:
+        raise ValueError("train_gt.csv has none of the expected columns: K, Mg, P2O5, pH")
+
+    scores /= n
+    thresholds = np.percentile(scores, [20, 40, 60, 80])
+    classes = np.zeros(len(scores), dtype=int)
+    for i, t in enumerate(thresholds):
+        classes[scores > t] = i + 1
+    return classes.tolist()
+
+
+class Hyperview2Dataset(Dataset):
+    """
+    Loads HYPERVIEW2 patches from data_dir.
+
+    Expects:
+        data_dir/train_gt.csv       — patch_id, K, Mg, P2O5, pH
+        data_dir/<patch_id>.*       — patch file (.npz or .npy), shape (H, W, C) or (C, H, W)
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        patch_ids: List[str],
+        health_classes: List[int],
+        num_bands: int = 150,
+        target_size: Tuple[int, int] = (64, 64),
+        train: bool = True,
+    ):
+        self.data_dir     = Path(data_dir)
+        self.patch_ids    = patch_ids
+        self.health_classes = health_classes
+        self.num_bands    = num_bands
+        self.target_size  = target_size
+        self.train        = train
+
+        dist = np.bincount(health_classes)
+        print(f"  {'Train' if train else 'Val'} — {len(patch_ids)} patches, "
+              f"class dist: {dist.tolist()}")
+
+    def _find_patch_file(self, patch_id: str) -> Path:
+        for ext in (".npz", ".npy", ".tif"):
+            p = self.data_dir / f"{patch_id}{ext}"
+            if p.exists():
+                return p
+        raise FileNotFoundError(
+            f"No patch file found for '{patch_id}' in {self.data_dir}. "
+            f"Run `python train.py --prepare` first."
+        )
+
+    def _load_patch(self, path: Path) -> np.ndarray:
+        """Load patch as float32 (C, H, W)."""
+        if path.suffix == ".npz":
+            data = np.load(path)
+            cube = data[list(data.keys())[0]].astype(np.float32)
+        elif path.suffix == ".npy":
+            cube = np.load(path).astype(np.float32)
+        else:
+            raise ValueError(f"Unsupported patch format: {path.suffix}")
+
+        # Ensure (C, H, W)
+        if cube.ndim == 2:
+            cube = cube[np.newaxis, :, :]           # (1, H, W) — single band
+        elif cube.ndim == 3 and cube.shape[2] < cube.shape[0]:
+            cube = cube.transpose(2, 0, 1)          # (H, W, C) → (C, H, W)
+
+        return cube
+
+    def __len__(self) -> int:
+        return len(self.patch_ids)
+
+    def __getitem__(self, idx: int):
+        path = self._find_patch_file(self.patch_ids[idx])
+        cube = self._load_patch(path)
+
+        # Resample bands
+        if cube.shape[0] != self.num_bands:
+            cube = zoom(cube, (self.num_bands / cube.shape[0], 1, 1), order=1)
+
+        # Spatial resize
+        tH, tW = self.target_size
+        H, W = cube.shape[1], cube.shape[2]
+        if (H, W) != (tH, tW):
+            cube = zoom(cube, (1, tH / H, tW / W), order=1)
+
+        # Random flips during training
+        if self.train:
+            if np.random.rand() > 0.5:
+                cube = cube[:, ::-1, :].copy()
+            if np.random.rand() > 0.5:
+                cube = cube[:, :, ::-1].copy()
+
+        # Band-wise z-score normalisation
+        mean = cube.mean(axis=(1, 2), keepdims=True)
+        std  = cube.std(axis=(1, 2),  keepdims=True) + 1e-8
+        cube = (cube - mean) / std
+
+        cube_t = torch.from_numpy(cube).unsqueeze(0)  # (1, C, H, W)
+
+        return (
+            cube_t,
+            torch.tensor(self.health_classes[idx], dtype=torch.long),
+            torch.zeros(len(CONTAMINANT_NAMES), dtype=torch.float32),
+        )
+
+
+def make_dataloaders(data_dir: str, cfg: dict) -> Tuple[DataLoader, DataLoader]:
+    """Build train/val DataLoaders from HYPERVIEW2 data directory."""
+    gt_path = Path(data_dir) / "train_gt.csv"
+    if not gt_path.exists():
+        raise FileNotFoundError(
+            f"train_gt.csv not found at {gt_path}. Run --prepare first."
+        )
+
+    gt = pd.read_csv(gt_path)
+    print(f"Loaded train_gt.csv: {len(gt)} patches, columns: {gt.columns.tolist()}")
+
+    health_classes = chemistry_to_health_class(gt)
+
+    # Identify the patch ID column
+    id_col = next((c for c in gt.columns if "id" in c.lower() or "patch" in c.lower()), gt.columns[0])
+    patch_ids = gt[id_col].astype(str).tolist()
+
+    # Train / val split
+    np.random.seed(42)
+    idx = np.random.permutation(len(patch_ids))
+    split = int(len(idx) * 0.8)
+    train_idx, val_idx = idx[:split], idx[split:]
+
+    num_bands   = cfg.get("num_bands", 150)
+    target_size = tuple(cfg.get("target_size", MODEL_DEFAULTS["target_size"]))
+
+    train_ds = Hyperview2Dataset(
+        data_dir, [patch_ids[i] for i in train_idx],
+        [health_classes[i] for i in train_idx],
+        num_bands=num_bands, target_size=target_size, train=True,
+    )
+    val_ds = Hyperview2Dataset(
+        data_dir, [patch_ids[i] for i in val_idx],
+        [health_classes[i] for i in val_idx],
+        num_bands=num_bands, target_size=target_size, train=False,
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg["batch_size"], shuffle=True,
+        num_workers=cfg["num_workers"], pin_memory=torch.cuda.is_available(), drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=cfg["batch_size"], shuffle=False,
+        num_workers=cfg["num_workers"], pin_memory=torch.cuda.is_available(),
+    )
+    return train_loader, val_loader
+
+
+# ── Dummy data (smoke test) ───────────────────────────────────────────────────
+
+class DummyDataset(Dataset):
+    def __init__(self, n: int, cfg: dict):
+        sz = cfg.get("target_size", (64, 64))
+        self.x = torch.randn(n, 1, cfg["num_bands"], sz[0], sz[1])
+        self.y = torch.randint(0, cfg["num_classes"], (n,))
+        self.c = torch.zeros(n, cfg["num_contaminants"])
+
+    def __len__(self): return len(self.x)
+    def __getitem__(self, i): return self.x[i], self.y[i], self.c[i]
+
+
+def make_dummy_dataloaders(cfg: dict) -> Tuple[DataLoader, DataLoader]:
+    print("Using dummy data — replace with real HYPERVIEW2 data for production.")
+    train_ds = DummyDataset(80, cfg)
+    val_ds   = DummyDataset(20, cfg)
+    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True)
+    val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"])
+    return train_loader, val_loader
+
+
+# ── Loss & validation ─────────────────────────────────────────────────────────
+
+def compute_loss(pred_health, pred_contam, health, contam, ce, contam_w):
+    ce_loss  = ce(pred_health, health)
     bce_loss = F.binary_cross_entropy(pred_contam, contam)
-    total    = ce_loss + contam_weight * bce_loss
-    return total, ce_loss, bce_loss
+    return ce_loss + contam_w * bce_loss, ce_loss, bce_loss
 
-
-# ── Validation ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def validate(
-    model: nn.Module,
-    loader: DataLoader,
-    ce_criterion: nn.CrossEntropyLoss,
-    contam_weight: float,
-    contam_names: list[str],
-    device: torch.device,
-) -> dict:
-    """
-    FIX 4 — full validation pass returning epoch-mean losses and per-class
-    ROC-AUC scores for the contaminant head.
-
-    Returns a dict with keys:
-        val_loss, val_ce_loss, val_bce_loss,
-        val_acc,
-        auc_<contaminant_name> for each contaminant,
-        val_auc_mean
-    """
+def validate(model, loader, ce, contam_w, device):
     model.eval()
-
     total_loss = total_ce = total_bce = 0.0
-    n_batches = 0
-    correct = 0
-    total_samples = 0
-
-    all_contam_probs  = []   # (N, num_contaminants)
-    all_contam_labels = []   # (N, num_contaminants)
+    correct = total = n_batches = 0
+    all_probs, all_labels = [], []
 
     for cube, health, contam in loader:
         cube, health, contam = cube.to(device), health.to(device), contam.to(device)
+        ph, pc = model(cube)
+        loss, ce_loss, bce_loss = compute_loss(ph, pc, health, contam, ce, contam_w)
+        total_loss += loss.item(); total_ce += ce_loss.item(); total_bce += bce_loss.item()
+        correct += (ph.argmax(1) == health).sum().item()
+        total += health.size(0)
+        n_batches += 1
+        all_probs.append(pc.cpu().numpy())
+        all_labels.append(contam.cpu().numpy())
 
-        pred_health, pred_contam = model(cube)
-
-        loss, ce_loss, bce_loss = compute_loss(
-            pred_health, pred_contam, health, contam, ce_criterion, contam_weight
-        )
-
-        total_loss += loss.item()
-        total_ce   += ce_loss.item()
-        total_bce  += bce_loss.item()
-        n_batches  += 1
-
-        preds = pred_health.argmax(dim=1)
-        correct       += (preds == health).sum().item()
-        total_samples += health.size(0)
-
-        all_contam_probs.append(pred_contam.cpu().numpy())
-        all_contam_labels.append(contam.cpu().numpy())
-
-    # Epoch-mean losses
-    metrics = {
-        "val_loss"    : total_loss / n_batches,
-        "val_ce_loss" : total_ce   / n_batches,
-        "val_bce_loss": total_bce  / n_batches,
-        "val_acc"     : correct / total_samples,
-    }
-
-    # FIX 4 — per-class ROC-AUC for the contaminant head.
-    # roc_auc_score requires at least one positive sample per class; fall back
-    # gracefully with a warning when a class is absent in the validation split.
-    probs  = np.concatenate(all_contam_probs,  axis=0)   # (N, C)
-    labels = np.concatenate(all_contam_labels, axis=0)   # (N, C)
-
+    probs  = np.concatenate(all_probs)
+    labels = np.concatenate(all_labels)
     auc_scores = []
-    for c, name in enumerate(contam_names):
-        y_true = labels[:, c]
-        y_score = probs[:, c]
-        if y_true.sum() == 0 or (1 - y_true).sum() == 0:
-            warnings.warn(
-                f"Contaminant '{name}' has only one class in the validation "
-                f"split — AUC is undefined; skipping.",
-                RuntimeWarning,
-            )
-            metrics[f"auc_{name}"] = float("nan")
-        else:
-            auc = roc_auc_score(y_true, y_score)
-            metrics[f"auc_{name}"] = auc
-            auc_scores.append(auc)
+    for c, name in enumerate(CONTAMINANT_NAMES):
+        y_true, y_score = labels[:, c], probs[:, c]
+        if y_true.sum() > 0 and (1 - y_true).sum() > 0:
+            auc_scores.append(roc_auc_score(y_true, y_score))
 
-    metrics["val_auc_mean"] = float(np.mean(auc_scores)) if auc_scores else float("nan")
-    return metrics
+    return {
+        "val_loss":     total_loss / n_batches,
+        "val_ce":       total_ce   / n_batches,
+        "val_bce":      total_bce  / n_batches,
+        "val_acc":      correct / total,
+        "val_auc_mean": float(np.mean(auc_scores)) if auc_scores else float("nan"),
+    }
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 
-def load_checkpoint(checkpoint_path: str, model: nn.Module, optimizer: torch.optim.Optimizer, 
-                   scheduler: torch.optim.lr_scheduler._LRScheduler, device: torch.device):
-    """Load training checkpoint and return starting epoch and best_auc"""
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_auc = checkpoint['best_auc']
-        print(f"Resumed training from epoch {start_epoch}, best AUC: {best_auc:.4f}")
-        return start_epoch, best_auc
-    except Exception as e:
-        print(f"Failed to load checkpoint: {e}")
-        return 0, -1.0
+def train(cfg: dict, data_dir: str = None, dummy: bool = False):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
+    if dummy:
+        train_loader, val_loader = make_dummy_dataloaders(cfg)
+    else:
+        train_loader, val_loader = make_dataloaders(data_dir, cfg)
 
-def create_dataloaders_from_dataset(
-    data_dir: str,
-    labels_file: str,
-    cfg: dict,
-    train_transform=None,
-    val_transform=None,
-) -> Tuple[DataLoader, DataLoader]:
-    """
-    Create train and validation dataloaders from real hyperspectral dataset.
-    
-    Args:
-        data_dir: Directory containing hyperspectral data files
-        labels_file: Path to CSV file with labels
-        cfg: Configuration dictionary
-        train_transform: Augmentation transform for training
-        val_transform: Augmentation transform for validation
-        
-    Returns:
-        Tuple of (train_loader, val_loader)
-    """
-    # Load labels first to split before creating datasets
-    import csv
-    paths, labels = [], []
-    with open(labels_file, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            paths.append(row["path"])
-            # Parse health_class and contaminant columns
-            health = int(row["health_class"])
-            contam = [float(row[name]) for name in CONTAMINANT_NAMES]
-            labels.append((health, contam))
-    
-    # Split data paths and labels
-    dataset_size = len(paths)
-    indices = list(range(dataset_size))
-    split = int(np.floor(DATA_DEFAULTS["train_val_split"] * dataset_size))
-    
-    np.random.seed(DATA_DEFAULTS["random_seed"])
-    np.random.shuffle(indices)
-    
-    train_indices = indices[split:]
-    val_indices = indices[:split]
-    
-    # Create separate datasets with their own transforms
-    train_dataset = HyperspectralSoilDataset(
-        data_paths=[paths[i] for i in train_indices],
-        labels=[labels[i] for i in train_indices],
+    model_name = cfg.get("model_name", "base")
+    model = create_model(
+        model_name,
         num_bands=cfg["num_bands"],
-        target_size=tuple(cfg.get("target_size", MODEL_DEFAULTS["target_size"])),
-        train=True,
-    )
-    
-    val_dataset = HyperspectralSoilDataset(
-        data_paths=[paths[i] for i in val_indices],
-        labels=[labels[i] for i in val_indices],
-        num_bands=cfg["num_bands"],
-        target_size=tuple(cfg.get("target_size", MODEL_DEFAULTS["target_size"])),
-        train=False,
-    )
-    
-    # Apply custom transforms if provided (overriding default train/test behavior)
-    if train_transform:
-        train_dataset.transform = train_transform
-    if val_transform:
-        val_dataset.transform = val_transform
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg["batch_size"],
-        shuffle=True,
-        num_workers=cfg["num_workers"],
-        pin_memory=True,
-        drop_last=True,
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg["batch_size"],
-        shuffle=False,
-        num_workers=cfg["num_workers"],
-        pin_memory=True,
-    )
-    
-    return train_loader, val_loader
+        num_classes=cfg["num_classes"],
+        num_contaminants=cfg["num_contaminants"],
+        bottleneck_dim=cfg.get("bottleneck_dim", 512),
+        dropout_p=cfg.get("dropout_p", 0.5),
+    ).to(device)
+    print(f"Model: {model_name}  params: {sum(p.numel() for p in model.parameters()):,}")
 
+    optimizer = AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=cfg["cosine_T0"], T_mult=cfg["cosine_T_mult"])
+    scaler    = torch.amp.GradScaler("cuda" if torch.cuda.is_available() else "cpu")
+    ce        = nn.CrossEntropyLoss(label_smoothing=cfg["label_smoothing"])
 
-class DummyDataset(Dataset):
-    """Simple dataset for testing with synthetic hyperspectral data."""
-    
-    def __init__(
-        self,
-        data: torch.Tensor,
-        health_labels: torch.Tensor,
-        contam_labels: torch.Tensor,
-    ):
-        self.data = data
-        self.health_labels = health_labels
-        self.contam_labels = contam_labels
+    best_auc      = -1.0
+    patience_left = cfg.get("patience", 10)
 
-    def __len__(self) -> int:
-        return len(self.data)
+    for epoch in range(cfg["epochs"]):
+        model.train()
+        running_loss = running_ce = running_bce = 0.0
+        n = 0
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return (
-            self.data[idx].unsqueeze(0),  # add channel dim → (1, bands, H, W)
-            self.health_labels[idx],
-            self.contam_labels[idx],
-        )
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader),
+                    desc=f"Epoch {epoch:03d}", leave=False)
 
+        for i, (cube, health, contam) in pbar:
+            cube, health, contam = cube.to(device), health.to(device), contam.to(device)
+            optimizer.zero_grad()
 
-def create_dummy_dataloaders(cfg: dict) -> Tuple[DataLoader, DataLoader]:
-    """
-    Create train and validation dataloaders with synthetic data for testing.
-    
-    Args:
-        cfg: Configuration dictionary
-        
-    Returns:
-        Tuple of (train_loader, val_loader)
-    """
-    print("⚠️  Using dummy data for testing. Replace with real data for production training.")
-    
-    num_samples = 100
-    target_size = cfg.get("target_size", MODEL_DEFAULTS["target_size"])
-    
-    # Create dummy hyperspectral data (samples, bands, H, W)
-    dummy_data = torch.randn(num_samples, cfg["num_bands"], target_size[0], target_size[1])
-    labels = torch.randint(0, cfg["num_classes"], (num_samples,))
-    contaminant_labels = torch.randint(0, 2, (num_samples, cfg["num_contaminants"])).float()
-    
-    # Split data
-    train_indices, val_indices = train_test_split(
-        range(num_samples),
-        test_size=DATA_DEFAULTS["train_val_split"],
-        random_state=DATA_DEFAULTS["random_seed"]
-    )
-    
-    # Create datasets
-    train_ds = DummyDataset(
-        dummy_data[train_indices],
-        labels[train_indices],
-        contaminant_labels[train_indices]
-    )
-    val_ds = DummyDataset(
-        dummy_data[val_indices],
-        labels[val_indices],
-        contaminant_labels[val_indices]
-    )
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg["batch_size"],
-        shuffle=True,
-        num_workers=0,  # Use 0 for dummy data to avoid multiprocessing overhead
-        pin_memory=True,
-    )
-    
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=cfg["batch_size"],
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-    )
-    
-    return train_loader, val_loader
-
-
-def train(cfg: dict, resume_path: str = None, data_dir: str = None, labels_file: str = None):
-    """
-    Main training function with optional resume capability.
-    
-    Args:
-        cfg: Configuration dictionary
-        resume_path: Path to checkpoint to resume from (optional)
-        data_dir: Directory containing hyperspectral data (if None, uses dummy data)
-        labels_file: Path to labels CSV file (required if data_dir is provided)
-    """
-    try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Training on: {device}")
-        
-        # Validate configuration
-        required_keys = ["num_bands", "num_classes", "num_contaminants", "batch_size", 
-                         "epochs", "lr", "weight_decay", "contam_loss_weight", 
-                         "label_smoothing", "cosine_T0", "cosine_T_mult", "grad_clip", 
-                         "num_workers", "save_path"]
-        
-        for key in required_keys:
-            if key not in cfg:
-                raise ValueError(f"Missing required configuration key: {key}")
-        
-        # Create dataloaders - real data if paths provided, else dummy data
-        if data_dir and labels_file:
-            print(f"Loading real data from: {data_dir}")
-            train_transform = HyperspectralTransform(
-                target_size=tuple(cfg.get("target_size", MODEL_DEFAULTS["target_size"]))
-            )
-            val_transform = HyperspectralTransform(
-                target_size=tuple(cfg.get("target_size", MODEL_DEFAULTS["target_size"])),
-                # Disable augmentation for validation
-                flip_prob=0.0,
-                elastic_prob=0.0,
-                crop_resize_prob=0.0,
-            )
-            train_loader, val_loader = create_dataloaders_from_dataset(
-                data_dir, labels_file, cfg, train_transform, val_transform
-            )
-        else:
-            train_loader, val_loader = create_dummy_dataloaders(cfg)
-
-        # Create model using factory - supports base, se, spectral, deep, hybrid variants
-        model_name = cfg.get("model_name", "base")
-        print(f"Using model variant: {model_name}")
-        
-        if model_name not in MODEL_VARIANTS:
-            raise ValueError(f"Unknown model: {model_name}. Choose from: {MODEL_VARIANTS}")
-        
-        # Extract model-specific kwargs from config
-        model_kwargs = {
-            "num_bands": cfg["num_bands"],
-            "num_classes": cfg["num_classes"],
-            "num_contaminants": cfg["num_contaminants"],
-            "bottleneck_dim": cfg.get("bottleneck_dim", 512),
-            "dropout_p": cfg.get("dropout_p", 0.5),
-        }
-        
-        # Add variant-specific kwargs
-        if model_name in ["se", "hybrid"]:
-            model_kwargs["se_reduction"] = cfg.get("se_reduction", 16)
-        if model_name == "deep":
-            model_kwargs["blocks_per_layer"] = cfg.get("blocks_per_layer", 3)
-        
-        model = create_model(model_name, **model_kwargs).to(device)
-        
-        # Log model size
-        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Model parameters: {total_params:,}")
-
-        optimizer  = AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
-        scheduler  = CosineAnnealingWarmRestarts(optimizer, T_0=cfg["cosine_T0"], T_mult=cfg["cosine_T_mult"])
-        scaler     = GradScaler()
-        ce_criterion = nn.CrossEntropyLoss(label_smoothing=cfg["label_smoothing"])
-
-        # Resume from checkpoint if provided
-        # Initialize early stopping variables before training loop
-        patience = cfg.get("patience", 10)  # Early stopping patience from config
-        best_auc = -1.0
-        patience_counter = 0
-        best_epoch = 0
-        start_epoch = 0
-
-        if resume_path:
-            start_epoch, best_auc = load_checkpoint(resume_path, model, optimizer, scheduler, device)
-            patience_counter = 0
-            best_epoch = start_epoch - 1
-
-        for epoch in range(start_epoch, cfg["epochs"]):
-            model.train()
-
-            # FIX 3 — running accumulators for epoch-mean loss tracking
-            running_loss = running_ce = running_bce = 0.0
-            n_batches = 0
-
-            pbar = tqdm(enumerate(train_loader), total=len(train_loader),
-                        desc=f"Epoch {epoch:03d} [train]", leave=False)
-
-            for i, (cube, health, contam) in pbar:
-                cube    = cube.to(device, non_blocking=True)
-                health  = health.to(device, non_blocking=True)
-                contam  = contam.to(device, non_blocking=True)
-
-                optimizer.zero_grad()
-
-                with autocast():
-                    pred_health, pred_contam = model(cube)
-                    # FIX 1 — weighted loss; contam_loss_weight is a tunable scalar
-                    loss, ce_loss, bce_loss = compute_loss(
-                        pred_health, pred_contam, health, contam,
-                        ce_criterion, cfg["contam_loss_weight"]
-                    )
-
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
-                scaler.step(optimizer)
-                scaler.update()
-
-                # FIX 2 — step scheduler with fractional epoch so CosineAnnealingWarmRestarts
-                # interpolates correctly within the epoch, not just at epoch boundaries.
-                scheduler.step(epoch + i / len(train_loader))
-
-                # FIX 3 — accumulate for running mean, not last-batch snapshot
-                running_loss += loss.item()
-                running_ce   += ce_loss.item()
-                running_bce  += bce_loss.item()
-                n_batches    += 1
-
-                pbar.set_postfix(
-                    loss=f"{running_loss / n_batches:.4f}",
-                    ce=f"{running_ce   / n_batches:.4f}",
-                    bce=f"{running_bce  / n_batches:.4f}",
-                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            with torch.amp.autocast("cuda" if torch.cuda.is_available() else "cpu"):
+                ph, pc = model(cube)
+                loss, ce_loss, bce_loss = compute_loss(
+                    ph, pc, health, contam, ce, cfg["contam_loss_weight"]
                 )
 
-            # Epoch-mean train losses
-            mean_loss = running_loss / n_batches
-            mean_ce   = running_ce   / n_batches
-            mean_bce  = running_bce  / n_batches
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step(epoch + i / len(train_loader))
 
-            # FIX 4 — full validation with per-class ROC-AUC
-            val_metrics = validate(
-                model, val_loader, ce_criterion,
-                cfg["contam_loss_weight"], CONTAMINANT_NAMES, device
-            )
+            running_loss += loss.item(); running_ce += ce_loss.item()
+            running_bce += bce_loss.item(); n += 1
 
-            # ── logging ───────────────────────────────────────────────────────────
-            auc_str = "  ".join(
-                f"{name}={val_metrics[f'auc_{name}']:.3f}"
-                for name in CONTAMINANT_NAMES
-            )
-            print(
-                f"Epoch {epoch:03d} | "
-                f"train loss {mean_loss:.4f} (ce {mean_ce:.4f} bce {mean_bce:.4f}) | "
-                f"val loss {val_metrics['val_loss']:.4f}  acc {val_metrics['val_acc']:.3f} | "
-                f"AUC mean {val_metrics['val_auc_mean']:.3f}  [{auc_str}]"
-            )
+            pbar.set_postfix(loss=f"{running_loss/n:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
-            # ── checkpoint on best mean AUC ───────────────────────────────────────
-            if val_metrics["val_auc_mean"] > best_auc:
-                best_auc = val_metrics["val_auc_mean"]
-                best_epoch = epoch
-                patience_counter = 0
-                
-                # Save full checkpoint for resuming
-                checkpoint = {
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'best_auc': best_auc,
-                    'cfg': cfg
-                }
-                torch.save(checkpoint, cfg["save_path"])
-                print(f"  ↳ saved best model (epoch {epoch}, mean AUC {best_auc:.4f})")
-            else:
-                patience_counter += 1
-                print(f"  ↳ no improvement for {patience_counter} epochs")
-                
-            # Early stopping
-            if patience_counter >= patience:
-                print(f"\nEarly stopping triggered after {patience} epochs without improvement")
-                print(f"Best model was from epoch {best_epoch} with AUC {best_auc:.4f}")
+        metrics = validate(model, val_loader, ce, cfg["contam_loss_weight"], device)
+
+        print(
+            f"Epoch {epoch:03d} | "
+            f"train loss {running_loss/n:.4f} | "
+            f"val loss {metrics['val_loss']:.4f}  acc {metrics['val_acc']:.3f}  "
+            f"AUC {metrics['val_auc_mean']:.3f}"
+        )
+
+        if metrics["val_auc_mean"] > best_auc:
+            best_auc = metrics["val_auc_mean"]
+            patience_left = cfg.get("patience", 10)
+            torch.save({"epoch": epoch, "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "best_auc": best_auc, "cfg": cfg}, cfg["save_path"])
+            print(f"  Saved best model (AUC {best_auc:.4f})")
+        else:
+            patience_left -= 1
+            if patience_left == 0:
+                print(f"Early stopping at epoch {epoch}.")
                 break
 
-        print(f"\nTraining complete. Best val AUC: {best_auc:.4f} (epoch {best_epoch})")
-        print(f"Model saved to: {cfg['save_path']}")
-        
-    except Exception as e:
-        print(f"Training failed with error: {e}")
-        raise
-
-
-def parse_args():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description="Train Hyperspectral Soil Classification Model")
-    parser.add_argument("--config", type=str, help="Path to config JSON or YAML file")
-    parser.add_argument("--model", type=str, choices=MODEL_VARIANTS, 
-                       help=f"Model variant to use. Options: {', '.join(MODEL_VARIANTS)}")
-    parser.add_argument("--resume", type=str, help="Path to checkpoint to resume from")
-    parser.add_argument("--epochs", type=int, help="Number of epochs (overrides config)")
-    parser.add_argument("--lr", type=float, help="Learning rate (overrides config)")
-    parser.add_argument("--batch_size", type=int, help="Batch size (overrides config)")
-    parser.add_argument("--save_path", type=str, help="Save path for model (overrides config)")
-    parser.add_argument("--dropout", type=float, help="Dropout probability (overrides config)")
-    parser.add_argument("--calibrate", action="store_true", help="Enable radiometric calibration")
-    parser.add_argument("--calib_config", type=str, help="Path to calibration config file")
-    parser.add_argument("--data_dir", type=str, help="Directory containing hyperspectral data (.npy or .hdr files)")
-    parser.add_argument("--labels_file", type=str, help="Path to labels CSV file (required if --data_dir is provided)")
-    parser.add_argument("--use_dummy", action="store_true", help="Use dummy data for testing (ignores data_dir)")
-    parser.add_argument("--list_models", action="store_true", help="List available model variants and exit")
-    return parser.parse_args()
-
-
-def load_config(config_path: str) -> dict:
-    """Load configuration from JSON or YAML file"""
-    import yaml
-    
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    
-    with open(config_path, 'r') as f:
-        if config_path.endswith('.yaml') or config_path.endswith('.yml'):
-            config = yaml.safe_load(f)
-        else:
-            config = json.load(f)
-    
-    return config
-
-
-def update_config_from_args(cfg: dict, args) -> dict:
-    """Update config with command line arguments"""
-    if args.model:
-        cfg["model_name"] = args.model
-        # Apply variant-specific defaults if using a different model
-        variant_config = get_model_config(args.model)
-        # Only override if not already set in config file
-        for key, value in variant_config.items():
-            if key not in cfg or cfg.get(key) == MODEL_DEFAULTS.get(key):
-                cfg[key] = value
-    if args.epochs:
-        cfg["epochs"] = args.epochs
-    if args.lr:
-        cfg["lr"] = args.lr
-    if args.batch_size:
-        cfg["batch_size"] = args.batch_size
-    if args.save_path:
-        cfg["save_path"] = args.save_path
-    if args.dropout:
-        cfg["dropout_p"] = args.dropout
-    
-    return cfg
+    print(f"\nDone. Best val AUC: {best_auc:.4f}  →  {cfg['save_path']}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def parse_args():
+    p = argparse.ArgumentParser(description="Train Icarus Hyperspectral CNN on HYPERVIEW2")
+    p.add_argument("--prepare",     action="store_true",
+                   help="Download patches from STAC catalog instead of training")
+    p.add_argument("--catalog",     type=str, default="/root/.cache/eotdl/datasets/HYPERVIEW2/catalog.v2.parquet",
+                   help="Path to catalog.v2.parquet")
+    p.add_argument("--data_dir",    type=str, default="./data/hyperview2",
+                   help="Directory where patches are stored (or will be downloaded to)")
+    p.add_argument("--dummy",       action="store_true",
+                   help="Train on synthetic data (no download needed)")
+    p.add_argument("--model",       type=str, default="base", choices=MODEL_VARIANTS)
+    p.add_argument("--epochs",      type=int)
+    p.add_argument("--lr",          type=float)
+    p.add_argument("--batch_size",  type=int)
+    p.add_argument("--save_path",   type=str)
+    p.add_argument("--resume",      type=str, help="Path to checkpoint to resume from")
+    return p.parse_args()
+
+
 if __name__ == "__main__":
     args = parse_args()
-    
-    # Handle list_models flag
-    if args.list_models:
-        print("Available Model Variants:")
-        print("=" * 60)
-        from configs.constants import MODEL_VARIANT_CONFIGS
-        for name in MODEL_VARIANTS:
-            config = MODEL_VARIANT_CONFIGS.get(name, {})
-            print(f"\n{name}:")
-            print(f"  {config.get('description', 'No description')}")
-            print(f"  Recommended lr: {config.get('lr', 3e-4)}")
-            print(f"  Recommended dropout: {config.get('dropout_p', 0.5)}")
-        print("\n" + "=" * 60)
-        print("\nUsage examples:")
-        print("  python train.py --model se --epochs 100")
-        print("  python train.py --model hybrid --lr 2.5e-4 --dropout 0.55")
-        print("  python train.py --model deep --data_dir ./data --labels_file labels.csv")
-        exit(0)
-    
-    # Load configuration
-    if args.config:
-        cfg = load_config(args.config)
-        print(f"Loaded config from: {args.config}")
+
+    if args.prepare:
+        prepare_data(args.catalog, args.data_dir)
     else:
         cfg = CFG.copy()
-        print("Using default configuration")
-    
-    # Override config with command line arguments
-    cfg = update_config_from_args(cfg, args)
-    
-    # Print configuration
-    print("\nTraining configuration:")
-    print("=" * 60)
-    key_configs = ["model_name", "num_bands", "num_classes", "dropout_p", "lr", 
-                   "weight_decay", "batch_size", "epochs", "save_path"]
-    for key in key_configs:
-        if key in cfg:
-            print(f"  {key}: {cfg[key]}")
-    print("=" * 60)
-    print()
-    
-    # Determine data source
-    data_dir = None if args.use_dummy else args.data_dir
-    labels_file = None if args.use_dummy else args.labels_file
-    
-    # Validate data arguments
-    if data_dir and not labels_file:
-        parser.error("--labels_file is required when --data_dir is provided")
-    
-    # Start training
-    train(cfg, resume_path=args.resume, data_dir=data_dir, labels_file=labels_file)
+
+        # Apply model-variant defaults
+        cfg.update(get_model_config(args.model))
+
+        # CLI overrides
+        if args.epochs:     cfg["epochs"]     = args.epochs
+        if args.lr:         cfg["lr"]         = args.lr
+        if args.batch_size: cfg["batch_size"] = args.batch_size
+        if args.save_path:  cfg["save_path"]  = args.save_path
+
+        print("Config:", {k: cfg[k] for k in
+              ["model_name", "num_bands", "num_classes", "lr", "batch_size", "epochs", "save_path"]})
+
+        train(cfg, data_dir=args.data_dir, dummy=args.dummy)
